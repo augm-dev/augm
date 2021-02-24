@@ -3,6 +3,5 @@ node_modules
 *-lock.*
 *.lock
 *.log
-.env
 
-brainstorming
+meta
