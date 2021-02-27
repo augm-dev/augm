@@ -1,12 +1,12 @@
 {
-  "version": "0.0.2",
+  "version": "0.1.0",
   "name": "augm",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/augm-dev/augm.git"
   },
   "bin": {
-    "augm": "./cli.js"
+    "augm": "cli.js"
   },
   "description": "Modern web framework",
   "main": "index.js",
