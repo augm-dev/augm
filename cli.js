@@ -4,7 +4,7 @@ require = require("esm")(module)
 const sade = require('sade');
 const pkg = require('./package.json')
 const path = require('path')
-const { build } = require('./dist/index.js')
+const { build, dev } = require('./dist/index.js')
 
 const cli = sade('augm')
 
@@ -33,6 +33,14 @@ cli
   .action(({ c }) => {
     let config = parseConfig(c)
     build(config)
+  })
+
+cli
+  .command('dev')
+  .describe('Start a development server')
+  .action(({ c }) => {
+    let config = parseConfig(c)
+    dev(config)
   })
 
 

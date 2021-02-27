@@ -27,7 +27,7 @@ function totalist(dir, callback, pre='') {
 	}
 }
 
-require('chokidar');
+var chokidar = require('chokidar');
 require = require("esm")(module);
 
 
@@ -42,53 +42,211 @@ function isHidden(p, ignore, only){
   return !shouldInclude || shouldIgnore
 }
 
+const cwdify = (p) => path__default['default'].join(process.cwd(),p.replace(process.cwd(), ''));
+
 // TODO: handler errors such that it waits until error is resolved before continuing
-async function file_info(p, sources){
-  try{
-    await init;
-    let module;
-    let abs_path = path__default['default'].join(process.cwd(),p);
-    let js = (path__default['default'].extname(p) === '.js');
-    if(js){
-      try{
-        module = require(abs_path);
-      } catch(e){
-        console.log("watches: error with module " + p);
-        console.log(e);
-      }
-    }
-    let contents = await readFile(p);
-    let id=p;
-    sources.find(s => {
-      id = p.startsWith(s) ? p.replace(s,"") : p;
-      // it found the correct source when id != p
-      return id !== p;
-    });
-    let [imports, exports] = js ? parse(contents.toString('utf8')) : [null,null];
-    return { imports, exports, contents, js, id, module, p, abs_path }
-  } catch(e){
-    console.log("Error parsing " + p);
-    console.log(e);
-  }
+async function file_info(p){
+  await init;
+  let js = (path__default['default'].extname(p) === '.js');
+  let module = js ? require(p) : void 0;
+  let contents = await readFile(p, 'utf8');
+  let [imports, exports] = js ? parse(contents) : [null,null];
+  return { imports, exports, contents, js, p, module }
 }
 
-async function scan(sources=[], options={}){
-  let targets = {};
-  let paths = [];
+class Watcher{
+  constructor(sources, options={}){
+    Object.assign(this, {
+      sources: (Array.isArray(sources) ? sources : [sources]).map(s => cwdify(path__default['default'].normalize(s))),
+      options,
+      targets: {},
+      dependents: {},
+      subscribers: {}
+    });
+    this.cache = options.cache;
+    this.updateDependents = this.updateDependents.bind(this);
+    this.effects = this.effects.bind(this);
+    this.changeFile = this.changeFile.bind(this);
+    this.init = this.init.bind(this);
+    this.remove = this.remove.bind(this);
+    this.format = this.format.bind(this);
+
+    this.watcher = chokidar.watch(this.sources, {
+      ...options.chokidar,
+      ignoreInitial: true
+    })
+    .on('add', this.changeFile)
+    .on('change', this.changeFile)
+    .on('unlink', this.remove)
+    .on('unlinkDir', this.remove);
+
+    this.init().then(() => {
+      this.dispatch('ready', this.format(Object.keys(this.targets)));
+    }).catch(e => {
+      this.dispatch('error', "Error initializing watches");
+      console.log(e);
+    });
+  }
+
+  format(arr=[]){
+    return arr.map(p => {
+      let info = this.targets[p];
+      return {
+        contents: info.contents,
+        module: info.module,
+        p
+      }
+    })
+  }
+
+  async changeFile(p){
+    try{
+      p = cwdify(p);
+      await this.updateDependents(p);
+      let changed = await this.effects(p);
+      if(changed.length > 0){
+        this.dispatch('change', this.format(changed), this.format(Object.keys(this.targets)));
+      }
+    } catch(e){
+      this.dispatch('error', e);
+    }
+  }
+
+  async remove(p){
+    try {
+      p = cwdify(p);
+      let removed = [];
+      Object.keys(this.dependents).forEach(k => {
+        this.dependents[k].forEach(dep => {
+          if(dep.startsWith(p)){
+            this.dependents[k].delete(dep);
+            removed.push(dep);
+          }
+        });
+        if(this.dependents[k].size === 0 || k.startsWith(p)){
+          delete this.dependents[k];
+        }
+      });
+      this.dispatch('remove', removed);
+    } catch(e){
+      this.dispatch('error', e);
+    }
+  }
+
+  isTarget(p){
+    return this.sources.some(s => p.startsWith(s)) && !isHidden(p, this.options.ignore, this.options.only)
+  }
+
+  async init(){
+    await init;
+    let targets = scan(this.sources, this.options);
+    await Promise.all(
+      targets.map(({p}) => this.updateDependents(p))
+    );
+  }
+
+  clearCache(p){
+    delete this.cache[p];
+    delete require.cache[p];
+  }
+
+
+  async effects(p,changed=new Set()){
+    // if in source directory and isn't hidden
+    if(this.isTarget(p)){
+      changed.add(p);
+    }
+    this.clearCache(p);
+    if(this.dependents[p]){
+      let effect = async function(dep){
+        await this.effects(dep,changed);
+      }.bind(this);
+      let promises = [];
+      this.dependents[p].forEach((dep) => {
+        promises.push(effect(dep));
+      });
+      await Promise.all(promises);
+    }
+    return [...changed.values()];
+  }
+
+  async updateDependents(p){
+    this.clearCache(p);
+    let info = await file_info(p);
+    if(this.isTarget(p)){
+      this.targets[p] = info;
+      this.watcher.add(p);
+    }
+    if(info.js){
+      let relevant_imports = info.imports
+        // get import string
+        .map(({s,e}) => info.contents.substring(s,e))
+        // only include local imports
+        .filter(str => str.startsWith('.'))
+        // ensure import string includes .js extension
+        .map(str => str.endsWith('.js') ? str : str + '.js') 
+        // resolve import path
+        .map(str => path__default['default'].join(path__default['default'].dirname(p), str));
+
+      await Promise.all(
+        relevant_imports.map(async import_path => {
+          // if we haven't already tracked this file
+          if(!this.dependents[import_path]){
+            this.dependents[import_path] = new Set([p]);
+            // recursively search for dependencies to trigger file changes
+            await this.updateDependents(import_path);
+            // watch dependency for file changes
+            this.watcher.add(import_path);
+          }
+          else {
+            // ensure this path is included in dependency's dependents
+            this.dependents[import_path].add(p);
+          }
+        })
+      );
+    }
+    
+  }
+
+  async dispatch(event, ...args){
+    if(this.subscribers[event]){
+      let promises = [];
+      this.subscribers[event].forEach(cb => promises.push(cb(...args)));
+      await Promise.all(promises);
+    }
+  }
+
+  on(event, callback){
+    if(this.subscribers[event]){
+      this.subscribers[event].add(callback);
+    } else {
+      this.subscribers[event] = new Set([callback]);
+    }
+    return this;
+  }
+  
+}
+
+function watch(source, cache, options){
+  return new Watcher(source, cache, options);
+}
+
+function scan(sources=[], options={}){
+  let targets = [];
   sources = (Array.isArray(sources) ? sources : [sources]).map(path__default['default'].normalize);
 
-  sources.map(src => {
+  sources.forEach(src => {
     totalist(src,  (rel) => {
-      paths.push(path__default['default'].join(src, rel));
+      let p = cwdify(path__default['default'].join(src,rel));
+      if(!isHidden(p, options.ignore, options.only)){
+        targets.push({
+          contents: fs__default['default'].readFileSync(p,'utf8'),
+          module: require(p),
+          p
+        });
+      }
     });
   });
-
-  // for each path, await the file_info and fill targets
-  await Promise.all(paths.map(async p => {
-    if(!isHidden(p, options.ignore, options.only)){
-      targets[p] = await file_info(p, sources);
-    }
-  }));
   
   return targets
 }
@@ -134,44 +292,249 @@ async function writeFile(p, data){
   }
 }
 
+let FORCE_COLOR, NODE_DISABLE_COLORS, NO_COLOR, TERM, isTTY=true;
 if (typeof process !== 'undefined') {
-	(process.env);
-	process.stdout && process.stdout.isTTY;
+	({ FORCE_COLOR, NODE_DISABLE_COLORS, NO_COLOR, TERM } = process.env);
+	isTTY = process.stdout && process.stdout.isTTY;
 }
+
+const $ = {
+	enabled: !NODE_DISABLE_COLORS && NO_COLOR == null && TERM !== 'dumb' && (
+		FORCE_COLOR != null && FORCE_COLOR !== '0' || isTTY
+	),
+
+	// modifiers
+	reset: init$1(0, 0),
+	bold: init$1(1, 22),
+	dim: init$1(2, 22),
+	italic: init$1(3, 23),
+	underline: init$1(4, 24),
+	inverse: init$1(7, 27),
+	hidden: init$1(8, 28),
+	strikethrough: init$1(9, 29),
+
+	// colors
+	black: init$1(30, 39),
+	red: init$1(31, 39),
+	green: init$1(32, 39),
+	yellow: init$1(33, 39),
+	blue: init$1(34, 39),
+	magenta: init$1(35, 39),
+	cyan: init$1(36, 39),
+	white: init$1(37, 39),
+	gray: init$1(90, 39),
+	grey: init$1(90, 39),
+
+	// background colors
+	bgBlack: init$1(40, 49),
+	bgRed: init$1(41, 49),
+	bgGreen: init$1(42, 49),
+	bgYellow: init$1(43, 49),
+	bgBlue: init$1(44, 49),
+	bgMagenta: init$1(45, 49),
+	bgCyan: init$1(46, 49),
+	bgWhite: init$1(47, 49)
+};
+
+function run(arr, str) {
+	let i=0, tmp, beg='', end='';
+	for (; i < arr.length; i++) {
+		tmp = arr[i];
+		beg += tmp.open;
+		end += tmp.close;
+		if (!!~str.indexOf(tmp.close)) {
+			str = str.replace(tmp.rgx, tmp.close + tmp.open);
+		}
+	}
+	return beg + str + end;
+}
+
+function chain(has, keys) {
+	let ctx = { has, keys };
+
+	ctx.reset = $.reset.bind(ctx);
+	ctx.bold = $.bold.bind(ctx);
+	ctx.dim = $.dim.bind(ctx);
+	ctx.italic = $.italic.bind(ctx);
+	ctx.underline = $.underline.bind(ctx);
+	ctx.inverse = $.inverse.bind(ctx);
+	ctx.hidden = $.hidden.bind(ctx);
+	ctx.strikethrough = $.strikethrough.bind(ctx);
+
+	ctx.black = $.black.bind(ctx);
+	ctx.red = $.red.bind(ctx);
+	ctx.green = $.green.bind(ctx);
+	ctx.yellow = $.yellow.bind(ctx);
+	ctx.blue = $.blue.bind(ctx);
+	ctx.magenta = $.magenta.bind(ctx);
+	ctx.cyan = $.cyan.bind(ctx);
+	ctx.white = $.white.bind(ctx);
+	ctx.gray = $.gray.bind(ctx);
+	ctx.grey = $.grey.bind(ctx);
+
+	ctx.bgBlack = $.bgBlack.bind(ctx);
+	ctx.bgRed = $.bgRed.bind(ctx);
+	ctx.bgGreen = $.bgGreen.bind(ctx);
+	ctx.bgYellow = $.bgYellow.bind(ctx);
+	ctx.bgBlue = $.bgBlue.bind(ctx);
+	ctx.bgMagenta = $.bgMagenta.bind(ctx);
+	ctx.bgCyan = $.bgCyan.bind(ctx);
+	ctx.bgWhite = $.bgWhite.bind(ctx);
+
+	return ctx;
+}
+
+function init$1(open, close) {
+	let blk = {
+		open: `\x1b[${open}m`,
+		close: `\x1b[${close}m`,
+		rgx: new RegExp(`\\x1b\\[${close}m`, 'g')
+	};
+	return function (txt) {
+		if (this !== void 0 && this.has !== void 0) {
+			!!~this.has.indexOf(open) || (this.has.push(open),this.keys.push(blk));
+			return txt === void 0 ? this : $.enabled ? run(this.keys, txt+'') : txt+'';
+		}
+		return txt === void 0 ? chain([open], [blk]) : $.enabled ? run([blk], txt+'') : txt+'';
+	};
+}
+
+let { bold, dim, yellow } = $;
+
+let printer = {
+  print(message, color="blue"){
+    if(!this.silent){
+      console.log(`${$[color](`လ  ${bold("it")}`)} ${dim(':')} ${message}`);
+    }
+  },
+  warn(message){
+    this.print(message, "yellow");
+    // console.log(yellow("║"))
+    // console.log(`${yellow("╚═▷")}  ${message}`)
+  },
+  error(message, e){
+    this.print(message, "red");
+  },
+  success(message){
+    this.print(message, "green");
+  },
+  info(message){
+    this.print(message, "blue");
+  },
+  benchmarks(arr){
+    if(!this.silent){
+      if(arr.length){
+        console.log(dim("║"));
+      }
+      arr.forEach(([label, ...facts], i) => {
+        console.log(`${i === arr.length - 1 ? dim("╚══") : dim("╟══")} ${label} ${dim("═▷")}  ${facts.join(dim(' -- '))}`);
+      });
+    }
+  },
+  silent: false
+};
+
+// class Spinner{
+//   constructor(logo_art='◸/◿', loading_art=['◸-◿','◸\\◿','◸|◿','◸/◿'], error_art='◸x◿', success_art='◸✓◿'){
+//     Object.assign(this, { logo_art, error_art, success_art })
+//     this.s = ora({
+//     text: "initializing...",
+//       spinner: {
+//         interval: 80,
+//         frames: loading_art
+//       },
+//       color: 'yellow'
+//     })
+//   }
+//   ready(text="ready"){
+//     this.s.stopAndPersist({
+//       symbol: chalk.green(this.logo_art),
+//       text
+//     })
+//   }
+//   start(text="loading..."){
+//     this.s.start(text)
+//   }
+//   error(text="generic routo error"){
+//     this.s.stopAndPersist({
+//       symbol: chalk.red(this.error_art),
+//       text
+//     })
+//   }
+//   success(text="success"){
+//     this.s.stopAndPersist({
+//       symbol: chalk.green(this.success_art),
+//       text
+//     })
+//   }
+// }
 
 require('brotli-size');
 
 let { builder, ssrBuilder } = require('augm-dev');
+const handler = require('serve-handler');
+const http = require('http');
 
 // ignore . or _ prefixed folders or files
-let watches_options = { ignore: /(^|[\/\\])[\._]./ }; 
+let watches_options = {
+  cache: require.cache,
+  ignore: /(^|[\/\\])[\._]./, // ignore _ & . prefixed files/folders
+  only: /\.js$/ // only js files
+}; 
 
 // TODO: builder() should return { build, remove }
 // TODO: builder should cache build results and respond to streams
 
+async function write(obj){
+  let keys = Object.keys(obj);
+  await Promise.all(keys.map(p => writeFile(p, obj[p])));
+  printer.success(`Built ${keys.length} files`);
+}
+
+let build_it = builder({
+  input: 'it',
+  output: 'public/it',
+  builds: [
+    ssrBuilder()
+  ],
+  onWarn: printer.warn,
+  onError: printer.error,
+  onSuccess: printer.success
+});
+
 async function build(config){
   let start = Date.now();
-  let build_it = builder({
-    input: 'it',
-    output: 'public/it',
-    builds: [
-      ssrBuilder()
-    ],
-    onWarn: console.log,
-    onError: console.log,
-    onSuccess: console.log
+  let targets = scan('it', watches_options);
+  let output = await build_it(targets, targets);
+  await write(output);
+  printer.success(`Done in ${Date.now() - start}ms`);
+}
+
+function dev(config={}){
+  
+  watch('it',watches_options)
+    .on('ready', async (total) => {
+      let output = await build_it(total, total);
+      await write(output);
+    })
+    .on('change', async (changed, total) => {
+      let output = await build_it(changed, total);
+      await write(output);
+    })
+    .on('error', printer.error);
+
+  
+  const server = http.createServer((request, response) => {
+    return handler(request, response, {
+      public: 'public'
+    });
   });
-  let targets = await scan('it', watches_options);
-  targets = Object.values(targets);
-  let output = await build_it(targets);
-  let promises = [];
-  let files = 0;
-  for(let p in output){
-    files++;
-    promises.push(writeFile(p, output[p]));
-  }
-  await Promise.all(promises);
-  console.log(`Built ${files} files in ${Date.now() - start}ms`);
+
+  server.listen(3000, () => {
+    printer.success('Running at http://localhost:3000');
+  });
+
 }
 
 exports.build = build;
+exports.dev = dev;
