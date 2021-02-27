@@ -500,10 +500,7 @@ let build_it = builder({
       npm: dep => ({
         path: `https://cdn.skypack.dev/${dep}`,
         external: true,
-      }),
-      async optimize(code){
-        
-      }
+      })
     })
   ],
   onWarn: printer.warn,
