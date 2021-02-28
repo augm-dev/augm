@@ -471,7 +471,7 @@ let printer = {
 
 require('brotli-size');
 
-let { builder, ssrBuilder } = require('augm-dev');
+let { builder } = require('augm-dev');
 const handler = require('serve-handler');
 const http = require('http');
 
@@ -491,44 +491,44 @@ async function write(obj){
   printer.success(`Built ${keys.length} files`);
 }
 
-let build_it = builder({
-  input: 'it',
-  output: 'public/it',
-  builds: [
-    ssrBuilder({
-      minify: true,
-      npm: dep => ({
-        path: `https://cdn.skypack.dev/${dep}`,
-        external: true,
-      })
-    })
-  ],
-  onWarn: printer.warn,
-  onError: printer.error,
-  onSuccess: printer.success
-});
-
 async function build(config){
   let start = Date.now();
-  let targets = scan('it', watches_options);
-  let output = await build_it(targets, targets);
+  let output = {};
+  await Promise.all(
+    Object.keys(config).map(async k => {
+      let build_it = builder({
+        input: k,
+        builds: config[k]
+      });
+      let targets = scan('it', watches_options);
+      let new_builds =  await build_it(targets, targets);
+      Object.assign(output, new_builds);
+    })
+  );
   await write(output);
   printer.success(`Done in ${Date.now() - start}ms`);
 }
 
 function dev(config={}){
-  
-  watch('it',watches_options)
-    .on('ready', async (total) => {
-      let output = await build_it(total, total);
-      await write(output);
-    })
-    .on('change', async (changed, total) => {
-      let output = await build_it(changed, total);
-      await write(output);
-    })
-    .on('error', printer.error);
 
+  for(let k in config){
+    let build_it = builder({
+      input: k,
+      builds: config[k]
+    });
+
+    watch(k,watches_options)
+      .on('ready', async (total) => {
+        let output = await build_it(total, total);
+        await write(output);
+      })
+      .on('change', async (changed, total) => {
+        let output = await build_it(changed, total);
+        await write(output);
+      })
+      .on('error', printer.error);
+  
+  }
   
   const server = http.createServer((request, response) => {
     return handler(request, response, {

@@ -30,9 +30,10 @@
     "wicked-elements": "^3.1.1"
   },
   "dependencies": {
+    "@augm/site": "^0.0.1",
     "@rollup/plugin-virtual": "^2.0.3",
     "@rollup/stream": "^1.1.0",
-    "augm-dev": "^0.2.1",
+    "augm-dev": "^0.3.2",
     "brotli-size": "^4.0.0",
     "esm": "^3.2.25",
     "hash-obj": "^3.0.0",
